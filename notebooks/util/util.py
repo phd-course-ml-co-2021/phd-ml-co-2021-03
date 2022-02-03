@@ -25,6 +25,7 @@ from tensorflow.keras import callbacks
 # from sklearn.gaussian_process.kernels import RBF, WhiteKernel
 # import time
 # import skopt
+import os
 
 def euler_method(f, y0, t, return_gradients=False):
     # Prepare a data structure for the results
@@ -876,6 +877,41 @@ def split_datasets(dslist, fraction, seed=None):
     return res_a, res_b
 
 
+
+def load_cmapss_data(data_folder):
+    # Read the CSV files
+    fnames = ['train_FD001', 'train_FD002', 'train_FD003', 'train_FD004']
+    cols = ['machine', 'cycle', 'p1', 'p2', 'p3'] + [f's{i}' for i in range(1, 22)]
+    datalist = []
+    nmcn = 0
+    for fstem in fnames:
+        # Read data
+        data = pd.read_csv(f'{data_folder}/{fstem}.txt', sep=' ', header=None)
+        # Drop the last two columns (parsing errors)
+        data.drop(columns=[26, 27], inplace=True)
+        # Replace column names
+        data.columns = cols
+        # Add the data source
+        data['src'] = fstem
+        # Shift the machine numbers
+        data['machine'] += nmcn
+        nmcn += len(data['machine'].unique())
+        # Generate RUL data
+        cnts = data.groupby('machine')[['cycle']].count()
+        cnts.columns = ['ftime']
+        data = data.join(cnts, on='machine')
+        data['rul'] = data['ftime'] - data['cycle']
+        data.drop(columns=['ftime'], inplace=True)
+        # Store in the list
+        datalist.append(data)
+    # Concatenate
+    data = pd.concat(datalist)
+    # Put the 'src' field at the beginning and keep 'rul' at the end
+    data = data[['src'] + cols + ['rul']]
+    # data.columns = cols
+    return data
+
+
 # def generate_market_problem(nitems, rel_req, seed=None):
 #     # Seed the RNG
 #     np.random.seed(seed)
@@ -1555,3 +1591,446 @@ def split_datasets(dslist, fraction, seed=None):
 def plot_ml_model(model):
     return keras.utils.plot_model(model, show_shapes=True,
             show_layer_names=True, rankdir='LR')
+
+
+# ==============================================================================
+# Data manipulation
+# ==============================================================================
+
+def partition_by_field(data, field):
+    res = {}
+    for fval, gdata in data.groupby(field):
+        res[fval] = gdata
+    return res
+
+
+def split_datasets_by_field(data, field, fraction, seed=None):
+    # Seed the RNG
+    np.random.seed(seed)
+    # Obtain unique values of the field
+    unq_vals = np.unique(data[field])
+    # Shuffle
+    np.random.shuffle(unq_vals)
+    # Separate
+    sep = int(len(unq_vals) * fraction)
+    l1_vals = unq_vals[:sep]
+    l1_vals = set(l1_vals)
+    list1, list2 = [], []
+    for val, gdata in data.groupby(field):
+        if val in l1_vals:
+            list1.append(gdata)
+        else:
+            list2.append(gdata)
+    # Collate again
+    data1 = pd.concat(list1)
+    if len(list2) > 0:
+        data2 = pd.concat(list2)
+    else:
+        data2 = pd.DataFrame(columns=data1.columns)
+    return data1, data2
+
+
+def plot_rul(pred=None, target=None,
+        stddev=None,
+        q1_3=None,
+        same_scale=True,
+        figsize=None):
+    plt.figure(figsize=figsize)
+    if target is not None:
+        plt.plot(range(len(target)), target, label='target',
+                color='tab:orange')
+    if pred is not None:
+        if same_scale or target is None:
+            ax = plt.gca()
+        else:
+            ax = plt.gca().twinx()
+        ax.plot(range(len(pred)), pred, label='pred',
+                color='tab:blue')
+        if stddev is not None:
+            ax.fill_between(range(len(pred)),
+                    pred-stddev, pred+stddev,
+                    alpha=0.3, color='tab:blue', label='+/- std')
+        if q1_3 is not None:
+            ax.fill_between(range(len(pred)),
+                    q1_3[0], q1_3[1],
+                    alpha=0.3, color='tab:blue', label='1st/3rd quartile')
+    plt.legend()
+    plt.tight_layout()
+
+
+
+class RULCostModel:
+    def __init__(self, maintenance_cost, safe_interval=0):
+        self.maintenance_cost = maintenance_cost
+        self.safe_interval = safe_interval
+
+    def cost(self, machine, pred, thr, return_margin=False):
+        # Merge machine and prediction data
+        tmp = np.array([machine, pred]).T
+        tmp = pd.DataFrame(data=tmp,
+                           columns=['machine', 'pred'])
+        # Cost computation
+        cost = 0
+        nfails = 0
+        slack = 0
+        for mcn, gtmp in tmp.groupby('machine'):
+            idx = np.nonzero(gtmp['pred'].values < thr)[0]
+            if len(idx) == 0:
+                cost += self.maintenance_cost
+                nfails += 1
+            else:
+                cost -= max(0, idx[0] - self.safe_interval)
+                slack += len(gtmp) - idx[0]
+        if not return_margin:
+            return cost
+        else:
+            return cost, nfails, slack
+
+
+
+def optimize_threshold(machine, pred, th_range, cmodel,
+        plot=False, figsize=None):
+    # Compute the optimal threshold
+    costs = [cmodel.cost(machine, pred, thr) for thr in th_range]
+    opt_th = th_range[np.argmin(costs)]
+    # Plot
+    if plot:
+        plt.figure(figsize=figsize)
+        plt.plot(th_range, costs)
+        plt.xlabel('threshold')
+        plt.ylabel('cost')
+        plt.tight_layout()
+    # Return the threshold
+    return opt_th
+
+
+def rul_cutoff_and_removal(data, cutoff_min, cutoff_max, seed=None):
+    # Reseed the RNG
+    np.random.seed(seed)
+    # Loop over all machines
+    data_by_m = partition_by_field(data, 'machine')
+    for mcn, tmp in data_by_m.items():
+        # Revemove final rows in each sequence
+        cutoff = int(np.random.randint(cutoff_min, cutoff_max, 1))
+        data_by_m[mcn] = tmp.iloc[:-cutoff]
+    # Merge back
+    res = pd.concat(data_by_m.values())
+    # Delete RUL values
+    res['rul'] = -1
+    # Return results
+    return res
+
+
+
+class CstBatchGenerator(tf.keras.utils.Sequence):
+    def __init__(self, data, in_cols, batch_size, seed=42):
+        super(CstBatchGenerator).__init__()
+        self.data = data
+        self.in_cols = in_cols
+        self.dpm = partition_by_field(data, 'machine')
+        self.rng = np.random.default_rng(seed)
+        self.batch_size = batch_size
+        # Build the first sequence of batches
+        self.__build_batches()
+
+    def __len__(self):
+        return len(self.batches)
+
+    # def __getitem__(self, index):
+    #     idx = self.batches[index]
+    #     mcn = self.machines[index]
+    #     x = self.data[self.in_cols].loc[idx].values
+    #     y = self.data['rul'].loc[idx].values
+    #     return x, y
+
+
+    def __getitem__(self, index):
+        idx = self.batches[index]
+        # mcn = self.machines[index]
+        x = self.data[self.in_cols].loc[idx].values
+        y = self.data['rul'].loc[idx].values
+        flags = (y != -1)
+        info = np.vstack((y, flags, idx)).T
+        return x, info
+
+    def on_epoch_end(self):
+        self.__build_batches()
+
+    def __build_batches(self):
+        self.batches = []
+        self.machines = []
+        # Randomly sort the machines
+        # self.rng.shuffle(mcns)
+        # Loop over all machines
+        mcns = list(self.dpm.keys())
+        for mcn in mcns:
+            # Obtain the list of indices
+            index = self.dpm[mcn].index
+            # Padding
+            padsize = self.batch_size - (len(index) % self.batch_size)
+            padding = self.rng.choice(index, padsize)
+            idx = np.hstack((index, padding))
+            # Shuffle
+            self.rng.shuffle(idx)
+            # Split into batches
+            bt = idx.reshape(-1, self.batch_size)
+            # Sort each batch individually
+            bt = np.sort(bt, axis=1)
+            # Store
+            self.batches.append(bt)
+            self.machines.append(np.repeat([mcn], len(bt)))
+        # Concatenate all batches
+        self.batches = np.vstack(self.batches)
+        self.machines = np.hstack(self.machines)
+        # Shuffle the batches
+        bidx = np.arange(len(self.batches))
+        self.rng.shuffle(bidx)
+        self.batches = self.batches[bidx, :]
+        self.machines = self.machines[bidx]
+
+
+
+class CstRULRegressor(keras.Model):
+    def __init__(self, rul_pred, alpha, beta, maxrul):
+        super(CstRULRegressor, self).__init__()
+        # Store the base RUL prediction model
+        self.rul_pred = rul_pred
+        # Weights
+        self.alpha = alpha
+        self.beta = beta
+        self.maxrul = maxrul
+        # Loss trackers
+        self.ls_tracker = keras.metrics.Mean(name='loss')
+        self.mse_tracker = keras.metrics.Mean(name='mse')
+        self.cst_tracker = keras.metrics.Mean(name='cst')
+
+        self.cnt = 0
+
+    def call(self, data):
+        return self.rul_pred(data)
+
+    def train_step(self, data):
+        x, info = data
+        y_true = info[:, 0:1]
+        flags = info[:, 1:2]
+        idx = info[:, 2:3]
+
+        with tf.GradientTape() as tape:
+            # Obtain the predictions
+            y_pred = self.rul_pred(x, training=True)
+            # Compute the main loss
+            mse = tf.math.reduce_mean(flags * tf.math.square(y_pred-y_true))
+            # Compute the constraint regularization term
+            delta_pred = y_pred[1:] - y_pred[:-1]
+            delta_rul = -(idx[1:] - idx[:-1]) / self.maxrul
+            deltadiff = delta_pred - delta_rul
+            cst = tf.math.reduce_mean(tf.math.square(deltadiff))
+            loss = self.alpha * mse + self.beta * cst
+
+        # Compute gradients
+        tr_vars = self.trainable_variables
+        grads = tape.gradient(loss, tr_vars)
+
+        # Update the network weights
+        self.optimizer.apply_gradients(zip(grads, tr_vars))
+
+        # Track the loss change
+        self.ls_tracker.update_state(loss)
+        self.mse_tracker.update_state(mse)
+        self.cst_tracker.update_state(cst)
+        return {'loss': self.ls_tracker.result(),
+                'mse': self.mse_tracker.result(),
+                'cst': self.cst_tracker.result()}
+
+    @property
+    def metrics(self):
+        return [self.ls_tracker,
+                self.mse_tracker,
+                self.cst_tracker]
+
+
+def load_communities_data(data_folder, nan_discard_thr=0.05):
+    # Read the raw data
+    fname = os.path.join(data_folder, 'CommViolPredUnnormalizedData.csv')
+    data = pd.read_csv(fname, sep=';', na_values='?')
+    # Discard columns
+    dcols = list(data.columns[-18:-2]) # directly crime related
+    dcols = dcols + list(data.columns[7:12]) # race related
+    dcols = dcols + ['nonViolPerPop']
+    data = data.drop(columns=dcols)
+    # Use relative values
+    for aname in data.columns:
+        if aname.startswith('pct'):
+            data[aname] = data[aname] / 100
+        elif aname in ('numForeignBorn', 'persEmergShelt',
+                       'persHomeless', 'officDrugUnits',
+                       'policCarsAvail', 'policOperBudget', 'houseVacant'):
+            data[aname] = data[aname] / (data['pop'] / 100e3)
+    # Remove redundant column (a relative columns is already there)
+    data = data.drop(columns=['persUrban', 'numPolice',
+                              'policeField', 'policeCalls', 'gangUnit'])
+    # Discard columns with too many NaN values
+    thr = nan_discard_thr * len(data)
+    cols = data.columns[data.isnull().sum(axis=0) >= thr]
+    cols = [c for c in cols if c != 'violentPerPop']
+    data = data.drop(columns=cols)
+    # Remove all NaN values
+    data = data.dropna()
+    # Shuffle
+    rng = np.random.default_rng(42)
+    idx = np.arange(len(data))
+    rng.shuffle(idx)
+    return data.iloc[idx]
+
+
+def plot_pred_by_protected(data, pred, protected, figsize=None):
+    plt.figure(figsize=figsize)
+    # Prepare the data for the boxplot
+    x, lbls = [], []
+    # Append the baseline
+    pred = pred.ravel()
+    x.append(pred)
+    lbls.append('all')
+    # Append the sub-datasets
+    for aname, dom in protected.items():
+        for val in dom:
+            mask = (data[aname] == val)
+            x.append(pred[mask])
+            lbls.append(f'{aname}={val}')
+    plt.boxplot(x, labels=lbls)
+    plt.tight_layout()
+
+
+def DIDI_r(data, pred, protected):
+    res = 0
+    avg = np.mean(pred)
+    for aname, dom in protected.items():
+        for val in dom:
+            mask = (data[aname] == val)
+            res += abs(avg - np.mean(pred[mask]))
+    return res
+
+
+class CstDIDIModel(keras.Model):
+    def __init__(self, base_pred, attributes, protected, alpha, thr):
+        super(CstDIDIModel, self).__init__()
+        # Store the base predictor
+        self.base_pred = base_pred
+        # Weight and threshold
+        self.alpha = alpha
+        self.thr = thr
+        # Translate attribute names to indices
+        self.protected = {list(attributes).index(k): dom for k, dom in protected.items()}
+        # Loss trackers
+        self.ls_tracker = keras.metrics.Mean(name='loss')
+        self.mse_tracker = keras.metrics.Mean(name='mse')
+        self.cst_tracker = keras.metrics.Mean(name='cst')
+
+    def call(self, data):
+        return self.base_pred(data)
+
+    def train_step(self, data):
+        x, y_true = data
+
+        with tf.GradientTape() as tape:
+            y_pred = self.base_pred(x, training=True)
+            mse = self.compiled_loss(y_true, y_pred)
+            # Compute the constraint regularization term
+            ymean = tf.math.reduce_mean(y_pred)
+            didi = 0
+            for aidx, dom in self.protected.items():
+                for val in dom:
+                    mask = (x[:, aidx] == val)
+                    didi += tf.math.abs(ymean - tf.math.reduce_mean(y_pred[mask]))
+            cst = tf.math.maximum(0.0, didi - self.thr)
+            loss = mse + self.alpha * cst
+
+        # Compute gradients
+        tr_vars = self.trainable_variables
+        grads = tape.gradient(loss, tr_vars)
+
+        # Update the network weights
+        self.optimizer.apply_gradients(zip(grads, tr_vars))
+
+        # Track the loss change
+        self.ls_tracker.update_state(loss)
+        self.mse_tracker.update_state(mse)
+        self.cst_tracker.update_state(cst)
+        return {'loss': self.ls_tracker.result(),
+                'mse': self.mse_tracker.result(),
+                'cst': self.cst_tracker.result()}
+
+    @property
+    def metrics(self):
+        return [self.ls_tracker,
+                self.mse_tracker,
+                self.cst_tracker]
+
+
+class LagDualDIDIModel(keras.Model):
+    def __init__(self, base_pred, attributes, protected, thr):
+        super(LagDualDIDIModel, self).__init__()
+        # Store the base predictor
+        self.base_pred = base_pred
+        # Weight and threshold
+        self.alpha = tf.Variable(0., name='alpha')
+        self.thr = thr
+        # Translate attribute names to indices
+        self.protected = {list(attributes).index(k): dom for k, dom in protected.items()}
+        # Loss trackers
+        self.ls_tracker = keras.metrics.Mean(name='loss')
+        self.mse_tracker = keras.metrics.Mean(name='mse')
+        self.cst_tracker = keras.metrics.Mean(name='cst')
+
+    def call(self, data):
+        return self.base_pred(data)
+
+    def __custom_loss(self, x, y_true, sign=1):
+        y_pred = self.base_pred(x, training=True)
+        # loss, mse, cst = self.__custom_loss(x, y_true, y_pred)
+        mse = self.compiled_loss(y_true, y_pred)
+        # Compute the constraint regularization term
+        ymean = tf.math.reduce_mean(y_pred)
+        didi = 0
+        for aidx, dom in self.protected.items():
+            for val in dom:
+                mask = (x[:, aidx] == val)
+                didi += tf.math.abs(ymean - tf.math.reduce_mean(y_pred[mask]))
+        cst = tf.math.maximum(0.0, didi - self.thr)
+        loss = mse + self.alpha * cst
+        return sign*loss, mse, cst
+
+    def train_step(self, data):
+        x, y_true = data
+
+        with tf.GradientTape() as tape:
+            loss, mse, cst = self.__custom_loss(x, y_true, sign=1)
+
+        # Separate training variables
+        tr_vars = self.trainable_variables
+        wgt_vars = tr_vars[:-1]
+        mul_vars = tr_vars[-1:]
+
+        # Update the network weights
+        grads = tape.gradient(loss, wgt_vars)
+        self.optimizer.apply_gradients(zip(grads, wgt_vars))
+
+        with tf.GradientTape() as tape:
+            loss, mse, cst = self.__custom_loss(x, y_true, sign=-1)
+
+        grads = tape.gradient(loss, mul_vars)
+        self.optimizer.apply_gradients(zip(grads, mul_vars))
+
+        # Track the loss change
+        self.ls_tracker.update_state(loss)
+        self.mse_tracker.update_state(mse)
+        self.cst_tracker.update_state(cst)
+        return {'loss': self.ls_tracker.result(),
+                'mse': self.mse_tracker.result(),
+                'cst': self.cst_tracker.result()}
+
+    @property
+    def metrics(self):
+        return [self.ls_tracker,
+                self.mse_tracker,
+                self.cst_tracker]
