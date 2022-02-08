@@ -14,7 +14,7 @@ from tensorflow.keras import layers
 from tensorflow.keras import callbacks
 # from tensorflow.keras import models
 # from tensorflow.keras import activations
-# from sklearn import metrics
+from sklearn import metrics
 # from eml.net.embed import encode
 # import eml.backend.ortool_backend as ortools_backend
 # from eml.net.reader import keras_reader
@@ -25,7 +25,10 @@ from tensorflow.keras import callbacks
 # from sklearn.gaussian_process.kernels import RBF, WhiteKernel
 # import time
 # import skopt
+from sklearn.preprocessing import StandardScaler
 import os
+import pyscipopt as scip
+from ortools.linear_solver import pywraplp
 
 def euler_method(f, y0, t, return_gradients=False):
     # Prepare a data structure for the results
@@ -859,7 +862,7 @@ def sample_NPIs(npis, nweeks, seed=None):
 
 
 
-def split_datasets(dslist, fraction, seed=None):
+def split_datasets(dslist, fraction, seed=None, standardize=None):
     assert(0 < fraction < 1)
     assert(all(len(ds) == len(dslist[0]) for ds in dslist))
     # Seed the RNG
@@ -870,11 +873,26 @@ def split_datasets(dslist, fraction, seed=None):
     # Partition the indices
     sep = int(len(dslist[0]) * (1-fraction))
     # Partition the datasets
-    res_a, res_b = [], []
+    res_a, res_b, scalers = [], [], []
     for ds in dslist:
-        res_a.append(ds[idx[:sep]])
-        res_b.append(ds[idx[sep:]])
-    return res_a, res_b
+        # Split the datasets
+        a = ds.iloc[idx[:sep]].copy()
+        b = ds.iloc[idx[sep:]].copy()
+        # Apply standardization
+        if standardize is not None:
+            nstd = len(standardize)
+            scl = StandardScaler()
+            a[standardize] = scl.fit_transform(a[standardize].values.reshape(-1, nstd))
+            b[standardize] = scl.transform(b[standardize].values.reshape(-1, nstd))
+            scalers.append(scl)
+        # Store the datasets
+        res_a.append(a)
+        res_b.append(b)
+    # Apply standardization, if requested
+    if standardize is None:
+        return res_a, res_b
+    else:
+        return res_a, res_b, scalers
 
 
 
@@ -2034,3 +2052,153 @@ class LagDualDIDIModel(keras.Model):
         return [self.ls_tracker,
                 self.mse_tracker,
                 self.cst_tracker]
+
+
+def load_classification_dataset(csv_name, onehot_inputs=[]):
+    # Load data
+    data = pd.read_csv(csv_name)
+    # Apply one-hot encoding
+    if len(onehot_inputs) > 0:
+        data = pd.get_dummies(data, columns=onehot_inputs)
+    return data
+
+
+class MLPLearner(object):
+
+    def __init__(self, hidden, epochs=20, batch_size=32, verbose=0):
+        self.hidden = hidden
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.verbose = verbose
+        self.model = None
+        self.history = None
+        # self.classes = None
+
+    def fit(self, X, y):
+        # Build a model
+        input_size = X.shape[1]
+        output_size = y.shape[1]
+        self.model = build_ml_model(input_size, output_size,
+                self.hidden, output_activation='softmax')
+        # Train the model
+        self.history = train_ml_model(self.model, X, y, epochs=self.epochs,
+                batch_size=self.batch_size, verbose=self.verbose, loss='categorical_crossentropy')
+
+    def predict_proba(self, X):
+        return self.model.predict(X)
+
+    def predict(self, X):
+        y_prob = self.predict_proba(X)
+        y_idx = np.argmax(y_prob, axis=1)
+        return y_idx
+
+
+def balance_violation(y, bal_thr, nclasses):
+    # Define the refence value for the balance constraint
+    ref = len(y) / nclasses
+    # Compute class counts
+    val, cnt = np.unique(y, return_counts=True)
+    # Compute the violation
+    viol = np.maximum(0, np.abs(cnt - ref) / ref - bal_thr)
+    return np.sum(viol)
+
+
+def mt_learner(X, y, model, prob_output=False):
+    # Train the model
+    model.fit(X, y)
+    # Return the prediction vector
+    if not prob_output:
+        return model.predict(X)
+    else:
+        return model.predict_proba(X)
+
+
+# def mt_balance_master(X, y_true, y_pred, loss, bal_thr,
+#         time_limit=None, verbose=0):
+#     # Compute some useful parameters
+#     ns = len(y_true)
+#     nc = y_true.shape[1]
+
+#     # Build a model
+#     mdl = scip.Model('MT Master')
+#     # Set a time limit (if needed)
+#     if time_limit is not None:
+#         mdl.setParam('limits/time', time_limit)
+#     # Define verbosity
+#     if verbose == 0:
+#         mdl.hideOutput()
+
+#     # Build target variables
+#     z = {(i,j) : mdl.addVar(f'z_{i}', vtype='B') for i in range(ns) for j in range(nc)}
+#     # Define the loss w.r.t. the original labels
+#     loss_true = 0
+#     # Unique class constraints
+#     for i in range(ns):
+#         mdl.addCons(sum(z[i, j] for j in range(nc)) == 1)
+
+#     # Add the balance constraint
+#     ref = ns / nc
+#     for j in range(nc):
+#         mdl.addCons(sum(z[i, j] for i in range(ns)) <= ref + ref * bal_thr)
+#         mdl.addCons(sum(z[i, j] for i in range(ns)) >= ref - ref * bal_thr)
+
+#     # Add the objective
+
+#     # Solve
+#     mdl.optimize()
+#     status = mdl.getStatus()
+#     assert status in ('optimal', 'feasible')
+#     # Extract the target array
+#     mt = np.zeros((ns, nc))
+#     for i in range(ns):
+#         for j in range(nc):
+#             mt[i, j] = max(0, mdl.getVal(z[i, j]))
+#     # Return the results
+#     return mt
+
+
+def mt_balance_master(X, y_true, y_pred, loss, bal_thr,
+        time_limit=None, verbose=0):
+    # Compute some useful parameters
+    ns = len(y_true)
+    nc = y_true.shape[1]
+
+    # Build a model
+    slv = pywraplp.Solver.CreateSolver('CBC')
+    # Set a time limit (if needed)
+    if time_limit is not None:
+        slv.SetTimeLimit(time_limit)
+
+    # Build target variables
+    z = {(i,j) : slv.IntVar(0, 1, f'z_{i}') for i in range(ns) for j in range(nc)}
+    # Define the loss w.r.t. the original labels
+    loss_true = 0
+    # Unique class constraints
+    for i in range(ns):
+        slv.Add(sum(z[i, j] for j in range(nc)) == 1)
+
+    # # Add the balance constraint
+    # ref = ns / nc
+    # for j in range(nc):
+    #     slv.Add(sum(z[i, j] for i in range(ns)) <= ref + ref * bal_thr)
+    #     slv.Add(sum(z[i, j] for i in range(ns)) >= ref - ref * bal_thr)
+
+    # Add the objective
+    assert loss in ('hamming_distance', 'categorical_crossentropy')
+    if loss == 'hamming_distance':
+        # Compute gradient
+        nabla = lambda y: 2 * (y_pred - y)
+        pass
+    elif loss == 'categorical_crossentropy':
+        pass
+
+    # Solve
+    status = slv.Solve()
+    assert status in (slv.OPTIMAL, slv.FEASIBLE)
+    # Extract the target array
+    mt = np.zeros((ns, nc))
+    for i in range(ns):
+        for j in range(nc):
+            mt[i, j] = max(0, z[i, j].solution_value())
+    # Return the results
+    return mt
