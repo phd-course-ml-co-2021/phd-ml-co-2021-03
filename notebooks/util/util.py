@@ -4,31 +4,19 @@
 import numpy as np
 from matplotlib import pyplot as plt
 from scipy.integrate import odeint
-# from scipy import stats
 import pandas as pd
-# from skopt.space import Space
-# from skopt.sampler import Lhs
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras import callbacks
-# from tensorflow.keras import models
-# from tensorflow.keras import activations
 from sklearn import metrics
-# from eml.net.embed import encode
-# import eml.backend.ortool_backend as ortools_backend
-# from eml.net.reader import keras_reader
-# from eml.net.process import ibr_bounds
-# from ortools.linear_solver import pywraplp
-# import warnings
-# from sklearn.gaussian_process import GaussianProcessRegressor
-# from sklearn.gaussian_process.kernels import RBF, WhiteKernel
-# import time
-# import skopt
 from sklearn.preprocessing import StandardScaler
 import os
-import pyscipopt as scip
 from ortools.linear_solver import pywraplp
+import time
+from scipy.optimize import curve_fit
+from scipy.optimize import LinearConstraint
+from scipy.optimize import minimize
 
 def euler_method(f, y0, t, return_gradients=False):
     # Prepare a data structure for the results
@@ -2065,24 +2053,30 @@ def load_classification_dataset(csv_name, onehot_inputs=[]):
 
 class MLPLearner(object):
 
-    def __init__(self, hidden, epochs=20, batch_size=32, verbose=0):
+    def __init__(self, hidden, epochs=20, batch_size=32,
+            epochs_fine_tuning=None, verbose=0):
         self.hidden = hidden
         self.epochs = epochs
+        self.epochs_fine_tuning = epochs_fine_tuning
         self.batch_size = batch_size
         self.verbose = verbose
         self.model = None
         self.history = None
-        # self.classes = None
+        self.wall_time = None
 
     def fit(self, X, y):
         # Build a model
         input_size = X.shape[1]
         output_size = y.shape[1]
-        self.model = build_ml_model(input_size, output_size,
-                self.hidden, output_activation='softmax')
+        if self.epochs_fine_tuning is None or self.model is None:
+            self.model = build_ml_model(input_size, output_size,
+                    self.hidden, output_activation='softmax')
         # Train the model
-        self.history = train_ml_model(self.model, X, y, epochs=self.epochs,
+        start = time.time()
+        epochs_local = self.epochs if self.epochs_fine_tuning is None else self.epochs_fine_tuning
+        self.history = train_ml_model(self.model, X, y, epochs=epochs_local,
                 batch_size=self.batch_size, verbose=self.verbose, loss='categorical_crossentropy')
+        self.wall_time = time.time() - start
 
     def predict_proba(self, X):
         return self.model.predict(X)
@@ -2093,14 +2087,15 @@ class MLPLearner(object):
         return y_idx
 
 
-def balance_violation(y, bal_thr, nclasses):
+def avg_bal_deviation(y, bal_thr, nclasses):
     # Define the refence value for the balance constraint
     ref = len(y) / nclasses
     # Compute class counts
     val, cnt = np.unique(y, return_counts=True)
-    # Compute the violation
-    viol = np.maximum(0, np.abs(cnt - ref) / ref - bal_thr)
-    return np.sum(viol)
+    # Compute the balance metric value
+    # viol = np.maximum(0, np.abs(cnt - ref) / ref - bal_thr)
+    viol = np.abs(cnt - ref) / ref
+    return np.mean(viol)
 
 
 def mt_learner(X, y, model, prob_output=False):
@@ -2157,8 +2152,9 @@ def mt_learner(X, y, model, prob_output=False):
 #     return mt
 
 
-def mt_balance_master(X, y_true, y_pred, loss, bal_thr,
-        time_limit=None, verbose=0):
+def mt_balance_master(y_true, y_pred, bal_thr, alpha=1,
+        time_limit=None, mode='gradient'):
+    assert mode in ('gradient', 'direct', 'projection', 'original')
     # Compute some useful parameters
     ns = len(y_true)
     nc = y_true.shape[1]
@@ -2167,38 +2163,242 @@ def mt_balance_master(X, y_true, y_pred, loss, bal_thr,
     slv = pywraplp.Solver.CreateSolver('CBC')
     # Set a time limit (if needed)
     if time_limit is not None:
-        slv.SetTimeLimit(time_limit)
+        slv.SetTimeLimit(1000 * time_limit)
 
     # Build target variables
-    z = {(i,j) : slv.IntVar(0, 1, f'z_{i}') for i in range(ns) for j in range(nc)}
-    # Define the loss w.r.t. the original labels
-    loss_true = 0
+    z = {(i,j) : slv.IntVar(0, 1, f'z[{i},{j}]') for i in range(ns) for j in range(nc)}
     # Unique class constraints
     for i in range(ns):
         slv.Add(sum(z[i, j] for j in range(nc)) == 1)
 
-    # # Add the balance constraint
-    # ref = ns / nc
-    # for j in range(nc):
-    #     slv.Add(sum(z[i, j] for i in range(ns)) <= ref + ref * bal_thr)
-    #     slv.Add(sum(z[i, j] for i in range(ns)) >= ref - ref * bal_thr)
+    # Add the balance constraint
+    ref = ns / nc
+    for j in range(nc):
+        slv.Add(sum(z[i, j] for i in range(ns)) <= ref + ref * bal_thr)
+        slv.Add(sum(z[i, j] for i in range(ns)) >= ref - ref * bal_thr)
 
-    # Add the objective
-    assert loss in ('hamming_distance', 'categorical_crossentropy')
-    if loss == 'hamming_distance':
-        # Compute gradient
-        nabla = lambda y: 2 * (y_pred - y)
-        pass
-    elif loss == 'categorical_crossentropy':
-        pass
+    # Define a customized sign function
+    def dsgn(yp, yt):
+        d = yp - yt
+        if d > 0: return 1
+        elif d < 0: return -1
+        else:
+            if yp == 1: return -1 # works better for discrete predictions
+            else: return 1 # works better for discrete predictions
+
+    # Add the objective (new version)
+    if mode == 'gradient':
+        # Build the gradient-based part of the objective
+        # - loss function: \sum_i \sum_j 0.5 * |y_i - \hat{y}_i|
+        # - (sub)gradient: \sum_i \sum_j 0.5 * sgn(y_i - \hat{y}_i)
+        # - (sub)gradient loss: \sum_i \sum_j 0.5 * sgn(y_i - \hat{y}_i) (z_i - y_i)
+        loss_t = 0
+        for i in range(ns):
+            for j in range(nc):
+                loss_t += 0.5 * dsgn(y_pred[i, j], y_true[i, j]) * (z[i, j] - y_pred[i, j])
+    else:
+        # Hamming distance w.r.t. true labels
+        loss_t = 0
+        for i in range(ns):
+            for j in range(nc):
+                loss_t += 0.5 * (y_true[i, j] * (1 - z[i, j]) + (1 - y_true[i, j]) * z[i, j])
+
+    # Build the quadratic part of the objective
+    # - loss function: \sum_i \sum_j (z_i - y_i)^2
+    # - linearize loss function: \sum_i \sum_j z_i (1 - y_i)^2 + (1 - z_i) (0 - y_i)^2
+    if mode != 'projection' and mode != 'original':
+        loss_p = 0
+        for i in range(ns):
+            for j in range(nc):
+                loss_p += z[i, j] * (1 - y_pred[i, j])**2 + (1 - z[i, j]) * (0 - y_pred[i, j])**2
+    elif mode == 'original':
+        loss_p = 0
+        for i in range(ns):
+            for j in range(nc):
+                loss_p += 0.5 * (z[i, j] * np.abs(1 - y_pred[i, j]) + (1 - z[i, j]) * np.abs(0 - y_pred[i, j]))
+
+    # Define the cost function
+    if mode != 'projection':
+        slv.Minimize(alpha * loss_t + loss_p)
+    else:
+        slv.Minimize(loss_t)
 
     # Solve
     status = slv.Solve()
-    assert status in (slv.OPTIMAL, slv.FEASIBLE)
-    # Extract the target array
-    mt = np.zeros((ns, nc))
-    for i in range(ns):
-        for j in range(nc):
-            mt[i, j] = max(0, z[i, j].solution_value())
+
+    # Extract stats
+    stats = {'opt': status == slv.OPTIMAL,
+             'time': slv.WallTime() / 1000}
+
+    # Extract the adjusted target vector
+    sol = None
+    if status in (slv.OPTIMAL, slv.FEASIBLE):
+        # Extract the target array
+        sol = np.zeros((ns, nc))
+        for i in range(ns):
+            for j in range(nc):
+                sol[i, j] = max(0, z[i, j].solution_value())
+
     # Return the results
-    return mt
+    return sol, stats
+
+
+def mt_balance_stats(y_true_prob, y_pred_prob, bal_thr):
+    # Obtain conventional classes
+    y_true = np.argmax(y_true_prob, axis=1)
+    y_pred = np.argmax(y_pred_prob, axis=1)
+    # Compute accuracy
+    acc = metrics.accuracy_score(y_true, y_pred)
+    # Compute balance violation
+    bal = avg_bal_deviation(y_pred, bal_thr, y_pred_prob.shape[1])
+    # Return the results
+    return acc, bal
+
+
+def mt_balance_stats_master(y_true_prob, y_pred_prob, z_prob):
+    # Obtain conventional classes
+    y_true = np.argmax(y_true_prob, axis=1)
+    y_pred = np.argmax(y_pred_prob, axis=1)
+    z = np.argmax(z_prob, axis=1)
+    # Compute accuracy
+    acc = metrics.accuracy_score(y_true, z)
+    # Compute mean square distance
+    mse = metrics.mean_squared_error(y_true, z)
+    # Return the results
+    return acc, mse
+
+
+def mt_balance(X, y, learner, bal_thr, alpha=1, max_iter=1,
+        verbose=0, mode='gradient', master_tlim=None):
+    assert mode in ('gradient', 'direct', 'projection', 'original')
+    # Prepare result data structures
+    history = {'learner_acc':[], 'learner_bal':[],
+            'master_acc':[], 'm_l_dist':[],
+            'learner_time':[], 'master_time':[]}
+    def update_stats_learner(yp, ltime):
+        acc, bal = mt_balance_stats(y, yp, bal_thr)
+        history['learner_acc'].append(acc)
+        history['learner_bal'].append(bal)
+        history['learner_time'].append(ltime)
+    def update_stats_master(yp, zp, mtime):
+        acc, mse = mt_balance_stats_master(y, yp, zp)
+        history['master_acc'].append(acc)
+        history['m_l_dist'].append(mse)
+        history['master_time'].append(mtime)
+    # Pretraining
+    if mode != 'projection':
+        learner.fit(X, y)
+        yp = learner.predict_proba(X)
+        update_stats_learner(yp, learner.wall_time)
+    else:
+        yp = y.copy() # This is used only to compute the distance stat
+    # Start the main iteration
+    for k in range(max_iter):
+        # Compute local alpha
+        alpha_l = alpha / (k + 1)
+        # Master step
+        zp, stats = mt_balance_master(y, yp, bal_thr, alpha_l,
+                mode=mode, time_limit=master_tlim)
+        update_stats_master(yp, zp, stats['time'])
+        # Learner step
+        learner.fit(X, zp)
+        yp = learner.predict_proba(X)
+        update_stats_learner(yp, learner.wall_time)
+        # Print some information
+        if verbose > 0:
+            lacc, lbal, ltime, macc, dist, mtime = \
+                    history['learner_acc'][-1], \
+                    history['learner_bal'][-1], \
+                    history['learner_time'][-1], \
+                    history['master_acc'][-1], \
+                    history['m_l_dist'][-1], \
+                    history['master_time'][-1]
+            s = f'(#{k+1}) l-acc: {lacc:.2f}, l-bal: {lbal:.2f}, l-time: {ltime:.2f}s'
+            s += f', m-acc: {macc:.2f}, l-m dist: {dist:.2f}, m-time: {mtime:.2f}s'
+            print(s)
+        if mode == 'projection':
+            break
+    # Return history
+    return history
+
+
+def mtx_function_plot(xm, ym, f_true=None, f_pred=None, figsize=None):
+    fig = plt.figure(figsize=figsize)
+    plt.scatter(xm, ym, color='tab:red', label='measures')
+    span = xm[1] - xm[0]
+    x = np.linspace(xm[0] - 0.5*span, xm[1] + 0.5*span)
+    if f_true is not None:
+        plt.plot(x, f_true(x), linestyle=':', color='tab:blue', label='true function')
+    if f_pred is not None:
+        plt.plot(x, f_pred(x), color='tab:orange', label='estimated function', linestyle=':')
+        plt.scatter(xm, f_pred(xm), color='tab:orange', label='predictions')
+    plt.xlabel('x')
+    plt.ylabel('y')
+    plt.grid(linestyle=':')
+    plt.axis('equal')
+    plt.legend()
+
+    
+def mtx_output_plot(xm, ym, yp, f_bound=None, yf=None, plot_bias=False,
+        figsize=None, ylim=None):
+    fig = plt.figure(figsize=figsize)
+    y0 = np.linspace(ym[0] - 0.02, ym[0] + 0.22)
+    y1 = xm[1]**(np.log(y0) / np.log(xm[0]))
+    plt.gca().set_facecolor((0.95, 0.95, 0.95))
+    plt.axvspan(y0[0], y0[-1], color='white')
+    if plot_bias:
+        plt.plot(y0, y1, color='tab:orange', label='ML model bias')
+    plt.scatter(ym[0], ym[1], color='tab:red', label='measured values', zorder=2)
+    if yp is not None:
+        yp = np.array(yp).reshape(-1, 2)
+        plt.scatter(yp[:, 0], yp[:, 1], color='tab:orange', label='predictions', zorder=2)
+    if f_bound:
+        y1_bound = f_bound(y0)
+        ylim = max(plt.ylim()[0], ylim[0]), min(plt.ylim()[1], ylim[1])
+        plt.fill_between(y0, ylim[0], y1_bound, zorder=2, alpha=0.2, label='feasible output')
+    if yf is not None:
+        yf = np.array(yf).reshape(-1, 2)
+        plt.scatter(yf[:, 0], yf[:, 1], color='tab:blue', label='adjusted target', zorder=2)
+    if yf is not None and yp is not None:
+        tmp = np.empty((len(yp)+len(yf), yp.shape[1]))
+        tmp[0::2, :] = yp
+        tmp[1::2, :] = yf
+        plt.plot(tmp[:, 0], tmp[:, 1], linestyle=':', color='0.5', zorder=1)
+    plt.xlabel('y0')
+    plt.ylabel('y1')
+    plt.grid(linestyle=':')
+    plt.axis('equal')
+    plt.legend()
+    if ylim is not None:
+        plt.ylim(*ylim)
+
+def mtx_learner_step(xm, ym):
+    f = lambda x, a: x**a
+    p = curve_fit(f, xm, ym)
+    a_opt = p[0][0]
+    return lambda x: x**a_opt
+
+
+def mtx_master_step_alpha(ym, yp, alpha=0.1):
+    cst = LinearConstraint([[1.5, -1]], 0, np.inf)
+    obj = lambda y: alpha*2*np.dot((yp - ym), (y - yp)) + np.square(y - yp).sum()
+    res = minimize(obj, yp, constraints=[cst])
+    return res.x
+
+
+def mtx_moving_target_alpha(xm, ym, n, alpha=0.1):
+    ypl = []
+    yfl = []
+
+    f_pred = mtx_learner_step(xm, ym)
+    yp = f_pred(xm)
+    ypl.append(yp)
+    for i in range(n):
+        # Master step
+        yf = mtx_master_step_alpha(ym, yp, alpha=alpha/(i+1))
+        yfl.append(yf)
+        # Learner stpe
+        f_pred = mtx_learner_step(xm, yf)
+        yp = f_pred(xm)
+        ypl.append(yp)
+    return ypl, yfl, f_pred
